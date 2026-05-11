@@ -184,6 +184,47 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
     expect(activeRequestIds.has("req-tracked")).toBe(true);
   });
 
+  it("cancelActiveServerTurn cancels a resumed stream", async () => {
+    const promise = transport.reconnectToStream({ chatId: "chat-1" });
+
+    transport.handleStreamResuming({ id: "req-resumed-stop" });
+    const stream = (await promise) as ReadableStream<UIMessageChunk>;
+    const reader = stream.getReader();
+
+    expect(transport.cancelActiveServerTurn()).toBe(true);
+
+    expect(agent.sent).toHaveLength(3);
+    expect(JSON.parse(agent.sent[2])).toEqual({
+      type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL,
+      id: "req-resumed-stop"
+    });
+    expect(activeRequestIds.has("req-resumed-stop")).toBe(true);
+    await expect(reader.read()).rejects.toMatchObject({
+      name: "AbortError"
+    });
+  });
+
+  it("can opt in to server cancellation when a resumed stream is cancelled", async () => {
+    transport = new WebSocketChatTransport<ChatMessage>({
+      agent,
+      activeRequestIds,
+      cancelOnClientAbort: true
+    });
+    const promise = transport.reconnectToStream({ chatId: "chat-1" });
+
+    transport.handleStreamResuming({ id: "req-resumed-client-cancel" });
+    const stream = (await promise) as ReadableStream<UIMessageChunk>;
+
+    await expect(stream.cancel()).resolves.toBeUndefined();
+
+    expect(agent.sent).toHaveLength(3);
+    expect(JSON.parse(agent.sent[2])).toEqual({
+      type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL,
+      id: "req-resumed-client-cancel"
+    });
+    expect(activeRequestIds.has("req-resumed-client-cancel")).toBe(true);
+  });
+
   // ── handleStreamResumeNone basics ────────────────────────────────────
 
   it("handleStreamResumeNone returns false when no reconnectToStream is pending", () => {
@@ -278,6 +319,47 @@ describe("WebSocketChatTransport reconnectToStream + handleStreamResuming", () =
     await expect(reader.read()).rejects.toMatchObject({
       name: "AbortError"
     });
+  });
+
+  it("tool continuation stream cancel is local-only by default", async () => {
+    transport.expectToolContinuation();
+
+    const stream = (await transport.reconnectToStream({
+      chatId: "chat-1"
+    })) as ReadableStream<UIMessageChunk>;
+
+    expect(
+      transport.handleStreamResuming({ id: "req-tool-local-cancel" })
+    ).toBe(true);
+    await expect(stream.cancel()).resolves.toBeUndefined();
+
+    expect(agent.sent).toHaveLength(2);
+    expect(activeRequestIds.has("req-tool-local-cancel")).toBe(false);
+  });
+
+  it("tool continuation stream cancel sends server cancel when cancelOnClientAbort is true", async () => {
+    transport = new WebSocketChatTransport<ChatMessage>({
+      agent,
+      activeRequestIds,
+      cancelOnClientAbort: true
+    });
+    transport.expectToolContinuation();
+
+    const stream = (await transport.reconnectToStream({
+      chatId: "chat-1"
+    })) as ReadableStream<UIMessageChunk>;
+
+    expect(
+      transport.handleStreamResuming({ id: "req-tool-client-cancel" })
+    ).toBe(true);
+    await expect(stream.cancel()).resolves.toBeUndefined();
+
+    expect(agent.sent).toHaveLength(3);
+    expect(JSON.parse(agent.sent[2])).toEqual({
+      type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL,
+      id: "req-tool-client-cancel"
+    });
+    expect(activeRequestIds.has("req-tool-client-cancel")).toBe(true);
   });
 
   it("abortActiveToolContinuation keeps requestId in activeIds for server cleanup", async () => {

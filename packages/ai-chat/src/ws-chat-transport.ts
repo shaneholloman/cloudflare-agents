@@ -49,6 +49,13 @@ export type WebSocketChatTransportOptions<
    * Used by the onAgentMessage handler to skip messages already handled by the transport.
    */
   activeRequestIds?: Set<string>;
+  /**
+   * Whether generic client-side abort/cancel lifecycle should cancel the
+   * server turn. Explicit cancellation via cancelActiveServerTurn() always
+   * sends CF_AGENT_CHAT_REQUEST_CANCEL.
+   * @default false
+   */
+  cancelOnClientAbort?: boolean;
 };
 
 /**
@@ -62,6 +69,7 @@ export class WebSocketChatTransport<
   agent: AgentConnection;
   private prepareBody?: WebSocketChatTransportOptions<ChatMessage>["prepareBody"];
   private activeRequestIds?: Set<string>;
+  private cancelOnClientAbort: boolean;
 
   // Pending resume resolver — set by reconnectToStream, called by
   // handleStreamResuming when onAgentMessage sees CF_AGENT_STREAM_RESUMING.
@@ -75,11 +83,66 @@ export class WebSocketChatTransport<
   // to "submitted" before the server starts streaming.
   private _expectToolContinuation = false;
   private _abortToolContinuation: (() => boolean) | null = null;
+  private _activeServerTurnId: string | null = null;
+  private _cancelAttachedStream: (() => boolean) | null = null;
 
   constructor(options: WebSocketChatTransportOptions<ChatMessage>) {
     this.agent = options.agent;
     this.prepareBody = options.prepareBody;
     this.activeRequestIds = options.activeRequestIds;
+    this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
+  }
+
+  setCancelOnClientAbort(cancelOnClientAbort: boolean) {
+    this.cancelOnClientAbort = cancelOnClientAbort;
+  }
+
+  /**
+   * Explicitly cancel the active server turn, if any.
+   * This is separate from generic client-side abort/cancel lifecycle so
+   * clients can detach locally without stopping server work.
+   */
+  cancelActiveServerTurn(): boolean {
+    const requestId = this._activeServerTurnId;
+    let cancelledRequest = false;
+
+    if (requestId) {
+      this.sendCancelFrame(requestId);
+      this._cancelAttachedStream?.();
+      this.clearActiveServerTurn(requestId);
+      cancelledRequest = true;
+    }
+
+    const cancelledToolContinuation = this.abortActiveToolContinuation();
+    return cancelledRequest || cancelledToolContinuation;
+  }
+
+  private sendCancelFrame(requestId: string) {
+    try {
+      this.agent.send(
+        JSON.stringify({
+          id: requestId,
+          type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
+        })
+      );
+    } catch {
+      // Ignore failures (e.g. agent already disconnected)
+    }
+  }
+
+  private setActiveServerTurn(
+    requestId: string,
+    cancelAttachedStream: (() => boolean) | null
+  ) {
+    this._activeServerTurnId = requestId;
+    this._cancelAttachedStream = cancelAttachedStream;
+  }
+
+  private clearActiveServerTurn(requestId: string) {
+    if (this._activeServerTurnId === requestId) {
+      this._activeServerTurnId = null;
+      this._cancelAttachedStream = null;
+    }
   }
 
   /**
@@ -128,6 +191,23 @@ export class WebSocketChatTransport<
     return true;
   }
 
+  /**
+   * Called by the hook's shared message handler when a server turn finishes
+   * outside the currently attached transport stream, such as after local-only
+   * client cleanup.
+   */
+  handleServerTurnCompleted(requestId: string) {
+    this.clearActiveServerTurn(requestId);
+  }
+
+  /**
+   * Register a server turn that is being rendered outside a transport-owned
+   * stream, such as the hook's fallback cross-tab/resume observer path.
+   */
+  observeServerTurn(requestId: string) {
+    this.setActiveServerTurn(requestId, null);
+  }
+
   async sendMessages(options: {
     chatId: string;
     messages: ChatMessage[];
@@ -141,6 +221,7 @@ export class WebSocketChatTransport<
     const requestId = nanoid(8);
     const abortController = new AbortController();
     let completed = false;
+    let requestSent = false;
 
     // Build the request body
     let extraBody: Record<string, unknown> = {};
@@ -175,11 +256,18 @@ export class WebSocketChatTransport<
     // Single cleanup helper — every terminal path (done, error, abort)
     // goes through here exactly once.
     // keepId: when true, do NOT remove requestId from activeIds. Used by
-    // onAbort so that onAgentMessage continues to skip in-flight chunks
-    // and the server's final done:true broadcast until cleanup happens there.
-    const finish = (action: () => void, keepId = false) => {
+    // explicit cancellation so onAgentMessage skips in-flight chunks
+    // and the server's final done:true signal until cleanup happens there.
+    const finish = (
+      action: () => void,
+      keepId = false,
+      clearServerTurn = true
+    ) => {
       if (completed) return;
       completed = true;
+      if (clearServerTurn) {
+        this.clearActiveServerTurn(requestId);
+      }
       try {
         action();
       } catch {
@@ -194,24 +282,27 @@ export class WebSocketChatTransport<
     const abortError = new Error("Aborted");
     abortError.name = "AbortError";
 
-    // Abort handler: send cancel to server, then terminate the stream.
-    // Used by both the caller's abortSignal and stream.cancel().
-    // keepId=true: keep requestId in activeIds so onAgentMessage skips any
-    // in-flight chunks the server broadcasts before its done:true signal.
-    // The ID is removed by onAgentMessage when done:true is received.
+    const cancelActiveRequest = () => {
+      if (completed) return false;
+      finish(() => streamController.error(abortError), true);
+      return true;
+    };
+    this.setActiveServerTurn(requestId, cancelActiveRequest);
+
+    // Abort handler: terminate the local stream. By default, generic AI SDK
+    // abort/cancel lifecycle is local-only so durable server turns can continue
+    // and be resumed. Use cancelActiveServerTurn() for explicit user/app
+    // cancellation, or cancelOnClientAbort for request-lifetime semantics.
     const onAbort = () => {
       if (completed) return;
-      try {
-        agent.send(
-          JSON.stringify({
-            id: requestId,
-            type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
-          })
-        );
-      } catch {
-        // Ignore failures (e.g. agent already disconnected)
+      if (this.cancelOnClientAbort) {
+        if (requestSent) {
+          this.sendCancelFrame(requestId);
+        }
+        finish(() => streamController.error(abortError), requestSent);
+      } else {
+        finish(() => streamController.error(abortError), false, !requestSent);
       }
-      finish(() => streamController.error(abortError), true);
     };
 
     // streamController is assigned synchronously by start(), so it is
@@ -257,7 +348,7 @@ export class WebSocketChatTransport<
         };
 
         const onClose = () => {
-          finish(() => controller.close());
+          finish(() => controller.close(), false, false);
         };
 
         agent.addEventListener("message", onMessage, {
@@ -278,7 +369,12 @@ export class WebSocketChatTransport<
       if (options.abortSignal.aborted) onAbort();
     }
 
+    if (completed) {
+      return stream;
+    }
+
     // Send the request over WebSocket
+    requestSent = true;
     agent.send(
       JSON.stringify({
         id: requestId,
@@ -572,7 +668,12 @@ export class WebSocketChatTransport<
         }
       },
       cancel() {
-        finish(() => {});
+        if (requestId && transport.cancelOnClientAbort) {
+          transport.sendCancelFrame(requestId);
+          finish(() => {}, onResumeRef, onResumeNoneRef, true);
+        } else {
+          finish(() => {}, onResumeRef, onResumeNoneRef);
+        }
       }
     });
   }
@@ -589,22 +690,45 @@ export class WebSocketChatTransport<
     const agent = this.agent;
     const activeIds = this.activeRequestIds;
     const chunkController = new AbortController();
+    const abortError = new Error("Aborted");
+    abortError.name = "AbortError";
     let completed = false;
 
-    const finish = (action: () => void) => {
+    const finish = (
+      action: () => void,
+      keepId = false,
+      clearServerTurn = true
+    ) => {
       if (completed) return;
       completed = true;
+      if (clearServerTurn) {
+        this.clearActiveServerTurn(requestId);
+      }
       try {
         action();
       } catch {
         // Stream may already be closed
       }
-      activeIds?.delete(requestId);
+      if (!keepId) {
+        activeIds?.delete(requestId);
+      }
       chunkController.abort();
     };
 
+    const cancelActiveRequest = () => {
+      if (completed) return false;
+      finish(() => streamController.error(abortError), true);
+      return true;
+    };
+    this.setActiveServerTurn(requestId, cancelActiveRequest);
+
+    let streamController!: ReadableStreamDefaultController<UIMessageChunk>;
+    const transport = this;
+
     return new ReadableStream<UIMessageChunk>({
       start(controller) {
+        streamController = controller;
+
         const onMessage = (event: MessageEvent) => {
           try {
             const data = JSON.parse(
@@ -640,7 +764,7 @@ export class WebSocketChatTransport<
         };
 
         const onClose = () => {
-          finish(() => controller.close());
+          finish(() => controller.close(), false, false);
         };
 
         agent.addEventListener("message", onMessage, {
@@ -651,7 +775,12 @@ export class WebSocketChatTransport<
         });
       },
       cancel() {
-        finish(() => {});
+        if (transport.cancelOnClientAbort) {
+          transport.sendCancelFrame(requestId);
+          finish(() => {}, true);
+        } else {
+          finish(() => {}, false, false);
+        }
       }
     });
   }

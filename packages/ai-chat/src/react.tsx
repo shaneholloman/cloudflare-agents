@@ -461,6 +461,15 @@ type UseAgentChatOptions<
    */
   resume?: boolean;
   /**
+   * Whether generic client-side stream abort/cleanup should cancel the server
+   * turn. By default, client cleanup is local-only so the server turn can
+   * continue and be resumed on reconnect. Explicit stop() always cancels the
+   * server turn.
+   *
+   * @default false
+   */
+  cancelOnClientAbort?: boolean;
+  /**
    * Custom data to include in every chat request body.
    * Accepts a static object or a function that returns one (for dynamic values).
    * These fields are available in `onChatMessage` via `options.body`.
@@ -615,6 +624,7 @@ export function useAgentChat<
     autoContinueAfterToolResult = true, // Server auto-continues after tool results/approvals
     autoSendAfterAllConfirmationsResolved = true, // Legacy option for client-side batching
     resume = true, // Enable stream resumption by default
+    cancelOnClientAbort = false,
     body: bodyOption,
     prepareSendMessagesRequest,
     ...rest
@@ -887,6 +897,7 @@ export function useAgentChat<
     customTransportRef.current = new WebSocketChatTransport<ChatMessage>({
       agent: agentRef.current,
       activeRequestIds: localRequestIdsRef.current,
+      cancelOnClientAbort,
       prepareBody: async ({ messages: msgs, trigger, messageId }) => {
         // Start with the top-level body option (static or dynamic)
         let extraBody: Record<string, unknown> = {};
@@ -928,6 +939,7 @@ export function useAgentChat<
   // Always point the transport at the latest socket so sends/listeners
   // go through the current connection after _pk changes.
   customTransportRef.current.agent = agentRef.current;
+  customTransportRef.current.setCancelOnClientAbort(cancelOnClientAbort);
   const customTransport = customTransportRef.current;
 
   // Use a stable Chat ID that doesn't change when _pk changes.
@@ -1020,6 +1032,7 @@ export function useAgentChat<
 
   const stopWithToolContinuationAbort: typeof stop = useCallback(async () => {
     try {
+      customTransport.cancelActiveServerTurn();
       await stop();
     } finally {
       customTransport.abortActiveToolContinuation();
@@ -1722,6 +1735,7 @@ export function useAgentChat<
             streamId: data.id,
             messageId: nanoid()
           }).state;
+          customTransport.observeServerTurn(data.id);
           setIsServerStreaming(true);
           agentRef.current.send(
             JSON.stringify({
@@ -1764,6 +1778,7 @@ export function useAgentChat<
             }
 
             if (data.done) {
+              customTransport.handleServerTurnCompleted(data.id);
               restoreProtectedStreamingAssistant(localResponseIds.get(data.id));
               localResponseIds.delete(data.id);
               localRequestIdsRef.current.delete(data.id);
@@ -1819,6 +1834,9 @@ export function useAgentChat<
           }
           if (data.done || data.replayComplete) {
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
+          }
+          if (data.done) {
+            customTransport.handleServerTurnCompleted(data.id);
           }
 
           const result = broadcastTransition(streamStateRef.current, {

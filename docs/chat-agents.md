@@ -781,6 +781,7 @@ function Chat() {
 | `onToolCall`                  | `({ toolCall, addToolOutput }) => void`         | —        | Handle client-side tool execution                                                                                        |
 | `autoContinueAfterToolResult` | `boolean`                                       | `true`   | Auto-continue conversation after client tool results and approvals                                                       |
 | `resume`                      | `boolean`                                       | `true`   | Enable automatic stream resumption on reconnect                                                                          |
+| `cancelOnClientAbort`         | `boolean`                                       | `false`  | Cancel the server turn when generic client stream abort/cleanup occurs. Explicit `stop()` always cancels the server turn |
 | `body`                        | `object \| () => object`                        | —        | Custom data sent with every request                                                                                      |
 | `prepareSendMessagesRequest`  | `(options) => { body?, headers? }`              | —        | Advanced per-request customization                                                                                       |
 | `tools`                       | `Record<string, AITool>`                        | —        | Dynamic client-defined tools for SDK/platform use cases. Schemas are sent to the server automatically                    |
@@ -1169,7 +1170,17 @@ When streaming is active:
 2. If the client disconnects, the server continues streaming and buffering
 3. When the client reconnects, it receives all buffered chunks and resumes live streaming
 
-Disable with `resume: false`:
+Generic client stream abort/cleanup stays local to the browser by default, so the server turn keeps running and can be resumed later. An explicit `stop()` still sends server cancellation:
+
+```tsx
+const { messages, stop } = useAgentChat({ agent });
+```
+
+If your app intentionally wants client lifecycle to own server lifecycle, set `cancelOnClientAbort: true`.
+This is useful for request-lifetime or token-saving flows; explicit `stop()` is
+always server-side cancellation regardless of this option.
+
+Disable resume with `resume: false`:
 
 ```tsx
 const { messages } = useAgentChat({ agent, resume: false });

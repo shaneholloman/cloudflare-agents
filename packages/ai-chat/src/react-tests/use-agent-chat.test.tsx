@@ -4452,6 +4452,78 @@ describe("useAgentChat tool approval continuations (issue #1108)", () => {
   });
 });
 
+describe("useAgentChat client abort cancellation", () => {
+  function createAgentWithTarget({ name, url }: { name: string; url: string }) {
+    const target = new EventTarget();
+    const sentMessages: string[] = [];
+    const agent = createAgent({
+      name,
+      url,
+      send: (data: string) => sentMessages.push(data)
+    });
+
+    (agent as unknown as Record<string, unknown>).addEventListener =
+      target.addEventListener.bind(target);
+    (agent as unknown as Record<string, unknown>).removeEventListener =
+      target.removeEventListener.bind(target);
+
+    return { agent, target, sentMessages };
+  }
+
+  it("keeps explicit stop() as server cancellation by default", async () => {
+    const { agent, sentMessages } = createAgentWithTarget({
+      name: "explicit-stop",
+      url: "ws://localhost:3000/agents/chat/explicit-stop?_pk=abc"
+    });
+
+    let chatInstance: ReturnType<typeof useAgentChat> | null = null;
+
+    const TestComponent = () => {
+      const chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [] as UIMessage[]
+      });
+      chatInstance = chat;
+      return <div data-testid="status">{chat.status}</div>;
+    };
+
+    await act(async () => {
+      render(<TestComponent />, {
+        wrapper: ({ children }) => (
+          <StrictMode>
+            <Suspense fallback="Loading...">{children}</Suspense>
+          </StrictMode>
+        )
+      });
+      await sleep(10);
+    });
+
+    await act(async () => {
+      void chatInstance!.sendMessage({ text: "Hello" });
+      await sleep(10);
+    });
+
+    const requestId = sentMessages
+      .map((message) => JSON.parse(message) as Record<string, unknown>)
+      .find((message) => message.type === "cf_agent_use_chat_request")?.id;
+    expect(requestId).toBeDefined();
+
+    await act(async () => {
+      await chatInstance!.stop();
+      await sleep(10);
+    });
+
+    const cancelMessage = sentMessages
+      .map((message) => JSON.parse(message) as Record<string, unknown>)
+      .find((message) => message.type === "cf_agent_chat_request_cancel");
+    expect(cancelMessage).toEqual({
+      type: "cf_agent_chat_request_cancel",
+      id: requestId
+    });
+  });
+});
+
 describe("useAgentChat overlapping submits (issue #1231)", () => {
   function createAgentWithTarget({ name, url }: { name: string; url: string }) {
     const target = new EventTarget();
