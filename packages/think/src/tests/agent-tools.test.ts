@@ -10,6 +10,11 @@ type AgentToolInspection = Awaited<
 type ThinkAgentToolTestStub = {
   inspectAgentToolRun(runId: string): Promise<AgentToolInspection>;
   seedAgentToolLastErrorForTest(runId: string, error: string): Promise<void>;
+  setAgentToolOutputForTest(runId: string, output: unknown): Promise<void>;
+  clearAgentToolOutputForTest(runId: string): Promise<void>;
+  setStripTextResponseForTest(strip: boolean): Promise<void>;
+  setBeforeStepAsyncDelay(ms: number): Promise<void>;
+  resetTurnStateForTest(): Promise<void>;
   startAgentToolRun(
     input: unknown,
     options: { runId: string }
@@ -48,6 +53,83 @@ async function waitForAgentToolRun(
 }
 
 describe("Think agent tools", () => {
+  it("uses assistant text as the default agent-tool summary", async () => {
+    const agent = await freshAgent();
+    const runId = crypto.randomUUID();
+
+    await agent.startAgentToolRun("chat-like probe", { runId });
+    const inspection = await waitForAgentToolRun(agent, runId);
+
+    expect(inspection).toMatchObject({
+      runId,
+      status: "completed",
+      summary: "Hello from the assistant!"
+    });
+    expect(inspection?.error).toBeUndefined();
+  });
+
+  it("completes when a non-chat agent-tool run emits no assistant text", async () => {
+    const agent = await freshAgent();
+    const runId = crypto.randomUUID();
+
+    await agent.setStripTextResponseForTest(true);
+    await agent.startAgentToolRun("non-chat probe", { runId });
+    const inspection = await waitForAgentToolRun(agent, runId);
+
+    expect(inspection).toMatchObject({
+      runId,
+      status: "completed",
+      summary: ""
+    });
+    expect(inspection?.error).toBeUndefined();
+  });
+
+  it("returns structured output for a non-chat agent-tool run", async () => {
+    const agent = await freshAgent();
+    const runId = crypto.randomUUID();
+
+    await agent.setStripTextResponseForTest(true);
+    await agent.setAgentToolOutputForTest(runId, {
+      ok: true,
+      value: "workflow-result"
+    });
+    await agent.startAgentToolRun("structured non-chat probe", { runId });
+    const inspection = await waitForAgentToolRun(agent, runId);
+
+    expect(inspection).toMatchObject({
+      runId,
+      status: "completed",
+      output: { ok: true, value: "workflow-result" },
+      summary: '{"ok":true,"value":"workflow-result"}'
+    });
+
+    await agent.clearAgentToolOutputForTest(runId);
+    await expect(agent.inspectAgentToolRun(runId)).resolves.toMatchObject({
+      runId,
+      status: "completed",
+      output: { ok: true, value: "workflow-result" },
+      summary: '{"ok":true,"value":"workflow-result"}'
+    });
+  });
+
+  it("marks skipped agent-tool turns as errors", async () => {
+    const agent = await freshAgent();
+    const runId = crypto.randomUUID();
+
+    await agent.setBeforeStepAsyncDelay(50);
+    await agent.startAgentToolRun("skipped probe", { runId });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await agent.resetTurnStateForTest();
+
+    const inspection = await waitForAgentToolRun(agent, runId);
+
+    expect(inspection).toMatchObject({
+      runId,
+      status: "error",
+      error: "Agent tool run was skipped before the child could finish."
+    });
+  });
+
   it("cleans in-memory agent-tool bookkeeping after a run completes", async () => {
     const agent = await freshAgent();
     const runId = crypto.randomUUID();

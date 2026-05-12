@@ -1776,8 +1776,14 @@ export function useAgentChat<
             if (data.done || data.replayComplete) {
               pendingReplayResumeRequestIdsRef.current.delete(data.id);
             }
-
             if (data.done) {
+              if (
+                streamStateRef.current.status === "observing" &&
+                streamStateRef.current.streamId === data.id
+              ) {
+                streamStateRef.current = { status: "idle" };
+                setIsServerStreaming(false);
+              }
               customTransport.handleServerTurnCompleted(data.id);
               restoreProtectedStreamingAssistant(localResponseIds.get(data.id));
               localResponseIds.delete(data.id);
