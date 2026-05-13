@@ -88,10 +88,8 @@ import type {
   StreamTextOnChunkCallback,
   StreamTextOnStepFinishCallback,
   StreamTextOnToolCallFinishCallback,
-  TextStreamPart,
   ToolSet,
   TypedToolCall,
-  TypedToolResult,
   UIMessage
 } from "ai";
 import { convertToModelMessages, stepCountIs, streamText } from "ai";
@@ -112,12 +110,7 @@ import {
 } from "agents";
 
 const agentToolChunkEncoder = new TextEncoder();
-import type {
-  Connection,
-  FiberContext,
-  FiberRecoveryContext,
-  WSMessage
-} from "agents";
+import type { Connection, FiberRecoveryContext, WSMessage } from "agents";
 import {
   sanitizeMessage,
   enforceRowSizeLimit,
