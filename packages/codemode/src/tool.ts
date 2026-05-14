@@ -7,7 +7,7 @@ import type {
   ToolProviderTools,
   ResolvedProvider
 } from "./executor";
-import { normalizeCode } from "./normalize";
+import { runCode } from "./run-code";
 import { filterTools } from "./resolve";
 import {
   DEFAULT_DESCRIPTION,
@@ -119,26 +119,7 @@ export function createCodeTool(
   return tool({
     description,
     inputSchema: codeSchema,
-    execute: async ({ code }) => {
-      const normalizedCode = normalizeCode(code);
-
-      const executeResult = await executor.execute(
-        normalizedCode,
-        resolvedProviders
-      );
-
-      if (executeResult.error) {
-        const logCtx = executeResult.logs?.length
-          ? `\n\nConsole output:\n${executeResult.logs.join("\n")}`
-          : "";
-        throw new Error(
-          `Code execution failed: ${executeResult.error}${logCtx}`
-        );
-      }
-
-      const output: CodeOutput = { code, result: executeResult.result };
-      if (executeResult.logs) output.logs = executeResult.logs;
-      return output;
-    }
+    execute: async ({ code }) =>
+      runCode({ code, executor, providers: resolvedProviders })
   });
 }
